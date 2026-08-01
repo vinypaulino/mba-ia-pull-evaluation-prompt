@@ -3,6 +3,7 @@ Funções auxiliares para o projeto de otimização de prompts.
 """
 
 import os
+import time
 import yaml
 import json
 from typing import Dict, Any, Optional
@@ -10,6 +11,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Gemini free tier ~15 RPM; serialize + pace calls across LLM instances.
+_LLM_MIN_INTERVAL_SEC = float(os.getenv("LLM_MIN_INTERVAL_SEC", "4.5"))
+_last_llm_call_at = 0.0
+
+
+def _pace_llm_calls():
+    global _last_llm_call_at
+    elapsed = time.monotonic() - _last_llm_call_at
+    if elapsed < _LLM_MIN_INTERVAL_SEC:
+        time.sleep(_LLM_MIN_INTERVAL_SEC - elapsed)
+    _last_llm_call_at = time.monotonic()
 
 
 def load_yaml(file_path: str) -> Optional[Dict[str, Any]]:
@@ -216,11 +229,32 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.0):
                 "Obtenha uma chave em: https://aistudio.google.com/app/apikey"
             )
 
-        return ChatGoogleGenerativeAI(
+        llm = ChatGoogleGenerativeAI(
             model=model_name,
             temperature=temperature,
             google_api_key=api_key
         )
+
+        from langchain_core.runnables import RunnableLambda
+
+        def paced_call(input, config=None):
+            _pace_llm_calls()
+            last_error = None
+            for attempt in range(5):
+                try:
+                    if config is None:
+                        return llm.invoke(input)
+                    return llm.invoke(input, config=config)
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+                    if "429" in msg or "resource exhausted" in msg or "quota" in msg:
+                        time.sleep(20 * (attempt + 1))
+                        continue
+                    raise
+            raise last_error
+
+        return RunnableLambda(paced_call)
 
     else:
         raise ValueError(
